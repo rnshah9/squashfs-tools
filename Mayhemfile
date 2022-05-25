@@ -1,0 +1,5 @@
+project: rnshah9/squashfs-tools
+target: squashfs-tools
+
+cmds:
+  - cmd: /repo/squashfs-tools/unsquashfs @@
