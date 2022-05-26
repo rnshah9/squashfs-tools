@@ -1,5 +1,5 @@
 project: rnshah9/squashfs-tools
-target: squashfs-tools
+target: mksquashfs
 
 cmds:
   - cmd: /repo/squashfs-tools/mksquashfs @@ out
