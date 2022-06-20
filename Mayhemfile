@@ -1,4 +1,4 @@
-project: rnshah9/squashfs-tools
+project: squashfs-tools
 target: mksquashfs
 
 cmds:
