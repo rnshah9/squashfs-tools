@@ -2,4 +2,4 @@ project: squashfs-tools
 target: mksquashfs
 
 cmds:
-  - cmd: /repo/squashfs-tools/mksquashfs @@ out
+  - cmd: /mksquashfs @@ out
