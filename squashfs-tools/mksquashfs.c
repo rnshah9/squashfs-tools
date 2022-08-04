@@ -42,7 +42,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
-#include <setjmp.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <pthread.h>
@@ -252,6 +251,7 @@ int bwriter_size;
 /* compression operations */
 struct compressor *comp = NULL;
 int compressor_opt_parsed = FALSE;
+int X_opt_parsed = FALSE;
 void *stream = NULL;
 
 /* xattr stats */
@@ -445,7 +445,7 @@ void restorefs()
 }
 
 
-void sighandler()
+void sighandler(int arg)
 {
 	EXIT_MKSQUASHFS();
 }
@@ -1354,7 +1354,7 @@ static struct file_buffer *get_fragment(struct fragment *fragment)
 	struct squashfs_fragment_entry *disk_fragment;
 	struct file_buffer *buffer, *compressed_buffer;
 	long long start_block;
-	int res, size, index = fragment->index;
+	int res, size, index = fragment->index, compressed;
 	char locked;
 
 	/*
@@ -1426,10 +1426,11 @@ again:
 	pthread_mutex_lock(&fragment_mutex);
 	disk_fragment = &fragment_table[index];
 	size = SQUASHFS_COMPRESSED_SIZE_BLOCK(disk_fragment->size);
+	compressed = SQUASHFS_COMPRESSED_BLOCK(disk_fragment->size);
 	start_block = disk_fragment->start_block;
 	pthread_cleanup_pop(1);
 
-	if(SQUASHFS_COMPRESSED_BLOCK(disk_fragment->size)) {
+	if(compressed) {
 		int error;
 		char *data;
 
@@ -2498,6 +2499,8 @@ static void *frag_deflator(void *arg)
 	}
 
 	pthread_cleanup_pop(0);
+	return NULL;
+
 }
 
 
@@ -2520,8 +2523,9 @@ static void *frag_order_deflator(void *arg)
 			file_buffer->size, block_size, noF, 1);
 		write_buffer->block = file_buffer->block;
 		write_buffer->sequence = file_buffer->sequence;
-		write_buffer->size = c_byte;
+		write_buffer->size = SQUASHFS_COMPRESSED_SIZE_BLOCK(c_byte);
 		write_buffer->fragment = FALSE;
+		fragment_table[file_buffer->block].size = c_byte;
 		seq_queue_put(to_order, write_buffer);
 		TRACE("Writing fragment %lld, uncompressed size %d, "
 			"compressed size %d\n", file_buffer->block,
@@ -2540,11 +2544,9 @@ static void *frag_orderer(void *arg)
 		int block = write_buffer->block;
 
 		pthread_mutex_lock(&fragment_mutex);
-		fragment_table[block].size = write_buffer->size;
 		fragment_table[block].start_block = bytes;
 		write_buffer->block = bytes;
 		bytes += SQUASHFS_COMPRESSED_SIZE_BLOCK(write_buffer->size);
-		write_buffer->size = SQUASHFS_COMPRESSED_SIZE_BLOCK(write_buffer->size);
 		fragments_outstanding --;
 		log_fragment(block, write_buffer->block);
 		queue_put(to_writer, write_buffer);
@@ -2997,7 +2999,8 @@ again:
 		ERROR_START("Failed to read file %s", pathname(dir));
 		ERROR_EXIT(", creating empty file\n");
 		file = write_file_empty(dir, NULL, dup);
-	}
+	} else if(status)
+		BAD_ERROR("Unexpected status value in write_file()");
 
 	return file;
 }
@@ -6353,7 +6356,10 @@ int option_with_arg(char *string, char *table[])
 		if(strcmp(string + 1, table[i]) == 0)
 			break;
 
-	return table[i] != NULL;
+	if(table[i] != NULL)
+		return TRUE;
+
+	return compressor_option_args(comp, string);
 }
 
 
@@ -6388,15 +6394,20 @@ int sqfstar(int argc, char *argv[])
 		exit(0);
 	}
 
+	comp = lookup_compressor(COMP_DEFAULT);
+
 	/*
-	 * Scan the command line for -comp xxx option, this is to ensure
-	 * any -X compressor specific options are passed to the
-	 * correct compressor
+	 * Scan the command line for -comp xxx option, this should occur before
+	 * any -X compression specific options to ensure these options are passed
+	 * to the correct compressor
 	 */
 	for(i = 1; i < argc; i++) {
-		struct compressor *prev_comp = comp;
+		if(strncmp(argv[i], "-X", 2) == 0)
+			X_opt_parsed = 1;
 
 		if(strcmp(argv[i], "-comp") == 0) {
+			struct compressor *prev_comp = comp;
+
 			if(++i == argc) {
 				ERROR("%s: -comp missing compression type\n",
 					argv[0]);
@@ -6410,7 +6421,7 @@ int sqfstar(int argc, char *argv[])
 				display_compressors(stderr, "", COMP_DEFAULT);
 				exit(1);
 			}
-			if(prev_comp != NULL && prev_comp != comp) {
+			if(compressor_opt_parsed) {
 				ERROR("%s: -comp multiple conflicting -comp"
 					" options specified on command line"
 					", previously %s, now %s\n", argv[0],
@@ -6418,7 +6429,11 @@ int sqfstar(int argc, char *argv[])
 				exit(1);
 			}
 			compressor_opt_parsed = 1;
-
+			if(X_opt_parsed) {
+				ERROR("%s: -comp option should be before any "
+					"-X option\n", argv[0]);
+				exit(1);
+			}
 		} else if(argv[i][0] != '-')
 			break;
 		else if(option_with_arg(argv[i], sqfstar_option_table))
@@ -6447,14 +6462,6 @@ int sqfstar(int argc, char *argv[])
 	 * will cause too many problems to change now.  But tarfile reading
 	 * has no such issues */
 	always_use_fragments = TRUE;
-
-	/*
-	 * if no -comp option specified lookup default compressor.  Note the
-	 * Makefile ensures the default compressor has been built, and so we
-	 * don't need to to check for failure here
-	 */
-	if(comp == NULL)
-		comp = lookup_compressor(COMP_DEFAULT);
 
 	for(i = 1; i < dest_index; i++) {
 		if(strcmp(argv[i], "-no-hardlinks") == 0)
@@ -6553,7 +6560,9 @@ int sqfstar(int argc, char *argv[])
 						argv[i]);
 					if(!compressor_opt_parsed)
 						ERROR("%s: Did you forget to"
-							" specify -comp?\n",
+							" specify -comp, or "
+							"specify it after the"
+							" -X options?\n",
 							argv[0]);
 print_sqfstar_compressor_options:
 					ERROR("%s: selected compressor \"%s\""
